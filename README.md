@@ -11,7 +11,7 @@
 
 </div>
 
-> 📄 Google Apps Script で Gemini API を呼び出し、PDF を全文検索できる Slack / Chatbot 連携向けユーティリティ。少ないコードでドキュメント検索の PoC を素早く立ち上げられるよ！
+> 📄 Google Apps Script で Gemini API を呼び出し、PDF を全文検索できる Chatbot 連携向けユーティリティ。少ないコードでドキュメント検索の PoC を素早く立ち上げられるよ！
 
 ## 📑 目次
 - [✨ プロジェクト概要](#-プロジェクト概要)
@@ -89,12 +89,6 @@ flowchart TD
 - GitHub には `.clasp.json` や `client_secret.json` をコミットしないよう `.gitignore` に追加すること。
 - API キーのローテーションポリシーを決めて、定期的に更新するのが安心だよ。
 
-## 🧭 よくある質問
-**Q. PDF の言語が混在している場合はどうするの？**  
-A. Gemini API は多言語対応なので、自動で言語判定してくれるよ。必要に応じて `languageHints` を指定しよう。
-
-**Q. 大容量 PDF は扱える？**  
-A. 事前に Drive API でファイルサイズをチェックして、分割して処理すると安定するよ。
 
 ## 🤝 コントリビュート
 1. Issue を立てて改善内容を共有してね。
