@@ -144,9 +144,16 @@ function waitOperationDone_(apiKey, operationName) {
     } else {
       throw new Error(`operations.get failed: ${code} ${body}`);
     }
-    Utilities.sleep(CONFIG.OPERATION_POLL_INTERVAL_MS);
+    safeSleep(CONFIG.OPERATION_POLL_INTERVAL_MS);
   }
   throw new Error('Operation timeout: インデックス化が制限時間内に完了しませんでした。');
+}
+
+// ====== ユーティリティ ======
+function safeSleep(ms) {
+  if (typeof ms === 'number' && isFinite(ms) && ms >= 0) {
+    Utilities.sleep(Math.floor(ms));
+  }
 }
 
 // ====== 生成: File Search を有効にして質問 ======
