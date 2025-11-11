@@ -1,0 +1,160 @@
+name: '🦊 PR Review - Kozaki'
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: '${{ github.workflow }}-${{ github.event.pull_request.number }}'
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GH_PAT_KOZAKI }}
+      GITHUB_TOKEN: ${{ secrets.GH_PAT_KOZAKI }}
+      REVIEWER_DISPLAY: '🦊 狐崎煌羽'
+      REVIEWER_SIGNATURE: '狐崎煌羽'
+      PERSONA_PATH: '.github/prompts/reviewer-kozaki.md'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect PR context
+        id: context
+        env:
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+        run: |
+          set -euo pipefail
+
+          CONTEXT_DIR="$(mktemp -d)"
+          echo "context_dir=${CONTEXT_DIR}" >> "${GITHUB_OUTPUT}"
+
+          PR_JSON="$(gh pr view "${PR_NUMBER}" --json title,body,baseRefName,headRefName,author,additions,deletions,changedFiles)"
+          PR_TITLE="$(echo "${PR_JSON}" | jq -r '.title')"
+          PR_BODY="$(echo "${PR_JSON}" | jq -r '.body // ""')"
+          PR_BASE="$(echo "${PR_JSON}" | jq -r '.baseRefName')"
+          PR_HEAD="$(echo "${PR_JSON}" | jq -r '.headRefName')"
+          PR_AUTHOR="$(echo "${PR_JSON}" | jq -r '.author.login')"
+          PR_ADDITIONS="$(echo "${PR_JSON}" | jq -r '.additions')"
+          PR_DELETIONS="$(echo "${PR_JSON}" | jq -r '.deletions')"
+          PR_FILES_CHANGED="$(echo "${PR_JSON}" | jq -r '.changedFiles')"
+
+          printf '%s' "${PR_BODY}" > "${CONTEXT_DIR}/body.md"
+
+          gh pr diff "${PR_NUMBER}" --name-only | head -n 40 | sed 's/^/- /' > "${CONTEXT_DIR}/files.txt" || true
+
+          DIFF_PATH="${CONTEXT_DIR}/diff.patch"
+          gh pr diff "${PR_NUMBER}" --patch > "${DIFF_PATH}" || true
+          TOTAL_LINES=0
+          if [[ -f "${DIFF_PATH}" ]]; then
+            TOTAL_LINES="$(wc -l < "${DIFF_PATH}" | tr -d ' ')"
+            head -n 600 "${DIFF_PATH}" > "${CONTEXT_DIR}/diff_excerpt.patch"
+            if [[ "${TOTAL_LINES}" -gt 600 ]]; then
+              {
+                echo
+                echo "[diff truncated after 600 lines]"
+              } >> "${CONTEXT_DIR}/diff_excerpt.patch"
+            fi
+          else
+            : > "${CONTEXT_DIR}/diff_excerpt.patch"
+          fi
+
+          {
+            echo "title<<EOF"
+            echo "${PR_TITLE}"
+            echo 'EOF'
+            echo "author=${PR_AUTHOR}"
+            echo "base_ref=${PR_BASE}"
+            echo "head_ref=${PR_HEAD}"
+            echo "additions=${PR_ADDITIONS}"
+            echo "deletions=${PR_DELETIONS}"
+            echo "files_changed=${PR_FILES_CHANGED}"
+            echo "body_path=${CONTEXT_DIR}/body.md"
+            echo "files_path=${CONTEXT_DIR}/files.txt"
+            echo "diff_path=${CONTEXT_DIR}/diff_excerpt.patch"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build Gemini prompt
+        id: compose
+        env:
+          PERSONA_PATH: '${{ env.PERSONA_PATH }}'
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+          PR_TITLE: '${{ steps.context.outputs.title }}'
+          PR_AUTHOR: '${{ steps.context.outputs.author }}'
+          PR_BASE: '${{ steps.context.outputs.base_ref }}'
+          PR_HEAD: '${{ steps.context.outputs.head_ref }}'
+          PR_ADDITIONS: '${{ steps.context.outputs.additions }}'
+          PR_DELETIONS: '${{ steps.context.outputs.deletions }}'
+          PR_FILES_CHANGED: '${{ steps.context.outputs.files_changed }}'
+          BODY_PATH: '${{ steps.context.outputs.body_path }}'
+          FILES_PATH: '${{ steps.context.outputs.files_path }}'
+          DIFF_PATH: '${{ steps.context.outputs.diff_path }}'
+          PROMPT_OUTPUT_PATH: 'prompt.txt'
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/build_reviewer_prompt.py
+          {
+            echo 'prompt<<EOF'
+            cat prompt.txt
+            echo 'EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run Gemini reviewer
+        id: gemini
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          settings: |-
+            {
+              "debug": false,
+              "maxSessionTurns": 12,
+              "telemetry": {
+                "enabled": false,
+                "target": "gcp"
+              }
+            }
+          prompt: '${{ steps.compose.outputs.prompt }}'
+
+      - name: Prepare review comment
+        id: prepare_comment
+        env:
+          REVIEW_TEXT: "${{ steps.gemini.outputs.summary != '' && steps.gemini.outputs.summary || steps.gemini.outputs.text }}"
+        run: |
+          set -euo pipefail
+          if [[ -z "${REVIEW_TEXT}" ]]; then
+            echo "Model did not return any content" >&2
+            exit 1
+          fi
+          COMMENT_FILE="$(pwd)/review-kozaki.md"
+          {
+            echo "### ${REVIEWER_DISPLAY} のレビュー"
+            echo
+            printf '%s\n' "${REVIEW_TEXT}" | sed 's/\r$//'
+            echo
+            echo "— ${REVIEWER_SIGNATURE}"
+          } > "${COMMENT_FILE}"
+          echo "comment_path=${COMMENT_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Post comment to PR
+        env:
+          COMMENT_PATH: '${{ steps.prepare_comment.outputs.comment_path }}'
+          PR_NUMBER: '${{ github.event.pull_request.number }}'
+        run: |
+          set -euo pipefail
+          gh pr comment "${PR_NUMBER}" --body-file "${COMMENT_PATH}"

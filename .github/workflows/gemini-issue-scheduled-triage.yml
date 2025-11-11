@@ -1,0 +1,324 @@
+name: '📋 Gemini Scheduled Issue Triage'
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Runs every hour
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }}'
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: 'bash'
+
+permissions:
+  contents: 'read'
+  id-token: 'write'
+  issues: 'write'
+  statuses: 'write'
+
+jobs:
+  triage-issues:
+    timeout-minutes: 5
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Checkout repository'
+        uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # ratchet:actions/checkout@v4
+
+      - name: 'Generate GitHub App Token'
+        id: 'generate_token'
+        if: |-
+          ${{ vars.APP_ID }}
+        uses: 'actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e' # ratchet:actions/create-github-app-token@v2
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+
+      - name: 'Find untriaged issues'
+        id: 'find_issues'
+        uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea'
+        with:
+          github-token: '${{ secrets.GH_PAT || steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}'
+          script: |-
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Fetch all open issues with pagination
+            const allOpen = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            const candidates = [];
+            for (const it of allOpen) {
+              // Skip pull requests
+              if (it.pull_request) continue;
+              const labels = (it.labels || []).map(l => typeof l === 'string' ? l : l.name).filter(Boolean);
+              const hasNeedsTriage = labels.includes('status/needs-triage');
+              const hasNoLabels = labels.length === 0;
+              if (hasNoLabels || hasNeedsTriage) {
+                candidates.push({ number: it.number, title: it.title || '', body: it.body || '' });
+              }
+            }
+
+            core.info(`✅ Found ${candidates.length} issues to triage: ${candidates.map(i => '#' + i.number).join(', ')}`);
+            core.setOutput('issues_to_triage', JSON.stringify(candidates));
+
+      - name: 'Get Repository Labels'
+        id: 'get_labels'
+        uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea'
+        with:
+          github-token: '${{ steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}'
+          script: |-
+            const labels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const labelNames = labels.map(label => label.name).filter(Boolean);
+            core.setOutput('available_labels', labelNames.join(','));
+            core.info(`Found ${labelNames.length} labels: ${labelNames.join(', ')}`);
+            return labelNames;
+
+      - name: 'Run Gemini Issue Analysis'
+        if: |-
+          ${{ steps.find_issues.outputs.issues_to_triage != '[]' }}
+        uses: 'google-github-actions/run-gemini-cli@v0'
+        id: 'gemini_issue_analysis'
+        env:
+          GITHUB_TOKEN: '' # Do not pass any auth token here since this runs on untrusted inputs
+          ISSUES_TO_TRIAGE: '${{ steps.find_issues.outputs.issues_to_triage }}'
+          REPOSITORY: '${{ github.repository }}'
+          AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
+        with:
+          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          settings: |-
+            {
+              "debug": ${{ fromJSON(env.DEBUG || env.ACTIONS_STEP_DEBUG || false) }},
+              "maxSessionTurns": 25,
+              "coreTools": [],
+              "telemetry": {
+                "enabled": false,
+                "target": "gcp"
+              }
+            }
+          prompt: |-
+            ## Role
+
+            You are an issue triage assistant. Analyze ONLY the provided GitHub issues
+            and pick appropriate labels from the available labels list.
+
+            ## Inputs
+            - Available labels: "${{ env.AVAILABLE_LABELS }}"
+            - Candidate issues (JSON array): "${{ env.ISSUES_TO_TRIAGE }}"
+
+            ## Critical rules
+            - Output MUST be a JSON array.
+            - Every object MUST have an `issue_number` that appears in "${ISSUES_TO_TRIAGE}".
+            - Never include any issue numbers that are not in "${ISSUES_TO_TRIAGE}".
+            - If there is exactly one candidate, output exactly one object for that issue.
+            - Only choose labels from "${AVAILABLE_LABELS}".
+
+            ## Steps
+            1. Read the candidate issues from "${{ env.ISSUES_TO_TRIAGE }}".
+            2. For each candidate, select one or more labels from "${{ env.AVAILABLE_LABELS }}".
+            3. Return a JSON array with objects like:
+               ```json
+               [
+                 {
+                   "issue_number": 123,
+                   "labels_to_set": ["kind/bug", "priority/p2"],
+                   "explanation": "Brief reason"
+                 }
+               ]
+               ```
+
+            ## Constraints
+            - Reference variables exactly as shown; do NOT execute any shell commands.
+            - Do NOT fetch labels or issues yourself; use the inputs above.
+            - Output only valid JSON. Do not write any additional text.
+
+      - name: 'Apply Labels to Issues'
+        if: |-
+          ${{ steps.gemini_issue_analysis.outcome == 'success' &&
+              steps.gemini_issue_analysis.outputs.summary != '[]' }}
+        env:
+          REPOSITORY: '${{ github.repository }}'
+          LABELS_OUTPUT: '${{ steps.gemini_issue_analysis.outputs.summary }}'
+          AVAILABLE_LABELS: '${{ steps.get_labels.outputs.available_labels }}'
+          ISSUES_TO_TRIAGE: '${{ steps.find_issues.outputs.issues_to_triage }}'
+        uses: 'actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea'
+        with:
+          github-token: '${{ secrets.GH_PAT || steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}'
+          script: |-
+            // Hardened JSON extraction to tolerate extra text
+            const rawLabels = process.env.LABELS_OUTPUT || '';
+            core.info(`Raw labels JSON: ${rawLabels}`);
+
+            let parsedLabels;
+            let parseError = false;
+            try {
+              let jsonString = rawLabels;
+
+              // 1) Extract from ```json ... ```
+              const jsonBlock = jsonString.match(/```json\s*([\s\S]*?)\s*```/);
+              if (jsonBlock) {
+                jsonString = jsonBlock[1].trim();
+              } else {
+                // 2) Extract from ``` ... ```
+                const codeBlock = jsonString.match(/```\s*([\s\S]*?)\s*```/);
+                if (codeBlock) {
+                  jsonString = codeBlock[1].trim();
+                } else {
+                  // 3) Extract array substring [ ... ]
+                  const arrayMatch = jsonString.match(/(\[[\s\S]*\])/);
+                  if (arrayMatch) {
+                    jsonString = arrayMatch[1].trim();
+                  }
+                }
+              }
+
+              parsedLabels = JSON.parse(jsonString);
+              if (!Array.isArray(parsedLabels)) {
+                throw new Error('Expected a JSON array for multiple issues');
+              }
+              core.info(`Parsed labels JSON entries: ${parsedLabels.length}`);
+            } catch (err) {
+              core.warning(`Failed to parse labels JSON from Gemini output: ${err.message}. Will attempt fallback.\nRaw output: ${rawLabels}`);
+              parsedLabels = [];
+              parseError = true;
+            }
+
+            // Build a set of existing labels, and auto-create missing ones using GH_PAT
+            const available = new Set(
+              (process.env.AVAILABLE_LABELS || '')
+                .split(',')
+                .map(s => s.trim())
+                .filter(Boolean)
+            );
+            core.info(`Available labels (enforced): ${[...available].join(', ')}`);
+
+            // Build a set of candidate issue numbers to enforce scope
+            let candidates = [];
+            try {
+              candidates = JSON.parse(process.env.ISSUES_TO_TRIAGE || '[]');
+            } catch {}
+            const allowed = new Set(candidates.map(c => Number(c.number)).filter(n => Number.isInteger(n)));
+            core.info(`Will only apply to candidate issues: ${[...allowed].map(n => '#' + n).join(', ')}`);
+
+            let appliedCount = 0;
+            const ignoredNonCandidates = [];
+
+            for (const entry of parsedLabels) {
+              const issueNumber = entry.issue_number;
+              if (!issueNumber) {
+                core.info(`Skipping entry with no issue number: ${JSON.stringify(entry)}`);
+                continue;
+              }
+
+              if (!allowed.has(Number(issueNumber))) {
+                ignoredNonCandidates.push(Number(issueNumber));
+                continue;
+              }
+
+              // Set labels based on triage result
+              if (entry.labels_to_set && entry.labels_to_set.length > 0) {
+                const proposed = [...new Set(entry.labels_to_set.map(s => String(s).trim()).filter(Boolean))];
+
+                // Create any missing labels first
+                for (const label of proposed) {
+                  if (available.has(label)) continue;
+                  try {
+                    await github.rest.issues.createLabel({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      name: label,
+                      color: 'ededed',
+                      description: 'Auto-created by Gemini triage'
+                    });
+                    core.info(`Created missing label: ${label}`);
+                    available.add(label);
+                  } catch (err) {
+                    const status = err?.status || err?.response?.status;
+                    if (status === 422) {
+                      core.info(`Label already exists (race): ${label}`);
+                      available.add(label);
+                    } else {
+                      core.error(`Failed to create label '${label}': ${err}`);
+                    }
+                  }
+                }
+
+                const finalLabels = proposed.filter(l => available.has(l));
+                if (finalLabels.length === 0) {
+                  core.info(`Skipping #${issueNumber}: no applicable labels after creation attempts [${proposed.join(', ')}]`);
+                  continue;
+                }
+
+                try {
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    labels: finalLabels
+                  });
+                  const explanation = entry.explanation ? ` - ${entry.explanation}` : '';
+                  core.info(`Applied labels to #${issueNumber}: ${finalLabels.join(', ')}${explanation}`);
+                  appliedCount++;
+                } catch (err) {
+                  core.error(`Failed applying labels to #${issueNumber}: ${err}`);
+                }
+              } else {
+                // If no labels to set, leave the issue as is
+                core.info(`No labels to set for #${issueNumber}, leaving as is`);
+              }
+            }
+
+            if (ignoredNonCandidates.length > 0) {
+              core.info(`Ignored non-candidate issues from model output: ${ignoredNonCandidates.map(n => '#' + n).join(', ')}`);
+            }
+
+            // Fallback: if nothing applied to candidates, add a minimal triage label
+            if ((appliedCount === 0 || parseError) && allowed.size > 0) {
+              const fallbackLabel = 'status/needs-triage';
+              try {
+                if (!available.has(fallbackLabel)) {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: fallbackLabel,
+                    color: 'ededed',
+                    description: 'Auto-created fallback triage label'
+                  });
+                  available.add(fallbackLabel);
+                  core.info(`Created fallback label: ${fallbackLabel}`);
+                }
+
+                for (const num of allowed) {
+                  try {
+                    await github.rest.issues.addLabels({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: num,
+                      labels: [fallbackLabel]
+                    });
+                    core.info(`Applied fallback label to #${num}: ${fallbackLabel}`);
+                  } catch (err) {
+                    core.error(`Failed applying fallback label to #${num}: ${err}`);
+                  }
+                }
+              } catch (err) {
+                core.error(`Fallback labeling failed: ${err}`);
+              }
+            }

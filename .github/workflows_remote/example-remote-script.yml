@@ -1,0 +1,132 @@
+name: '📚 Example: Using Remote Scripts'
+
+# このワークフローは、リモートスクリプトの使い方を示すサンプルです〜✨
+# 実際の運用では、必要に応じてカスタマイズしてね！
+
+on:
+  workflow_dispatch:  # 手動実行用
+    inputs:
+      script_name:
+        description: 'Script to download and test'
+        required: true
+        type: choice
+        options:
+          - build_reviewer_prompt.py
+          - clamp_diff.py
+          - ensure_hf_space.py
+        default: 'build_reviewer_prompt.py'
+
+permissions:
+  contents: read
+
+jobs:
+  test-remote-script:
+    runs-on: ubuntu-latest
+    env:
+      REMOTE_REPO: 'Sunwood-ai-labsII/gemini-actions-lab'
+      REMOTE_BRANCH: 'main'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download remote script
+        env:
+          SCRIPT_NAME: ${{ github.event.inputs.script_name }}
+        run: |
+          set -euo pipefail
+          
+          echo "🚀 Downloading ${SCRIPT_NAME} from remote repository..."
+          
+          mkdir -p /tmp/remote-scripts
+          SCRIPT_URL="https://raw.githubusercontent.com/${REMOTE_REPO}/${REMOTE_BRANCH}/.github/scripts/${SCRIPT_NAME}"
+          
+          echo "📍 URL: ${SCRIPT_URL}"
+          
+          if ! curl -fsSL "${SCRIPT_URL}" -o "/tmp/remote-scripts/${SCRIPT_NAME}"; then
+            echo "❌ Failed to download script"
+            exit 1
+          fi
+          
+          chmod +x "/tmp/remote-scripts/${SCRIPT_NAME}"
+          echo "✅ Successfully downloaded: ${SCRIPT_NAME}"
+          
+          # スクリプトの内容確認（最初の10行）
+          echo ""
+          echo "📝 Script preview (first 10 lines):"
+          head -10 "/tmp/remote-scripts/${SCRIPT_NAME}"
+
+      - name: Verify script
+        env:
+          SCRIPT_NAME: ${{ github.event.inputs.script_name }}
+        run: |
+          set -euo pipefail
+          
+          echo "🔍 Verifying script..."
+          
+          # ファイルの存在確認
+          if [ ! -f "/tmp/remote-scripts/${SCRIPT_NAME}" ]; then
+            echo "❌ Script file not found"
+            exit 1
+          fi
+          
+          # Python スクリプトの場合は構文チェック
+          if [[ "${SCRIPT_NAME}" == *.py ]]; then
+            echo "🐍 Checking Python syntax..."
+            python3 -m py_compile "/tmp/remote-scripts/${SCRIPT_NAME}"
+            echo "✅ Python syntax is valid"
+          fi
+          
+          # ファイル情報表示
+          echo ""
+          echo "📊 File info:"
+          ls -lh "/tmp/remote-scripts/${SCRIPT_NAME}"
+          echo ""
+          echo "🎯 MD5 checksum:"
+          md5sum "/tmp/remote-scripts/${SCRIPT_NAME}"
+
+      - name: Test script (basic)
+        env:
+          SCRIPT_NAME: ${{ github.event.inputs.script_name }}
+        run: |
+          set -euo pipefail
+          
+          echo "🧪 Running basic test..."
+          
+          case "${SCRIPT_NAME}" in
+            "build_reviewer_prompt.py")
+              echo "📝 Testing build_reviewer_prompt.py..."
+              # ヘルプやバージョン情報があれば表示
+              python3 "/tmp/remote-scripts/${SCRIPT_NAME}" --help || echo "No help available"
+              ;;
+              
+            "clamp_diff.py")
+              echo "✂️ Testing clamp_diff.py..."
+              # シンプルな入力でテスト
+              echo -e "line1\nline2\nline3\nline4\nline5" | \
+                python3 "/tmp/remote-scripts/${SCRIPT_NAME}" 3 100
+              ;;
+              
+            "ensure_hf_space.py")
+              echo "🤗 Testing ensure_hf_space.py..."
+              python3 "/tmp/remote-scripts/${SCRIPT_NAME}" --help || echo "No help available"
+              ;;
+              
+            *)
+              echo "⚠️ No specific test defined for ${SCRIPT_NAME}"
+              ;;
+          esac
+          
+          echo "✅ Test completed!"
+
+      - name: Summary
+        run: |
+          echo "## 🎀 Remote Script Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✨ Successfully tested remote script download and execution!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository**: ${REMOTE_REPO}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${REMOTE_BRANCH}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Script**: ${{ github.event.inputs.script_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "よき〜！💕" >> $GITHUB_STEP_SUMMARY

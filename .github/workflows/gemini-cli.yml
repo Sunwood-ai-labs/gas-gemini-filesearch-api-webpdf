@@ -1,0 +1,282 @@
+name: '💬 Gemini CLI'
+
+on:
+  pull_request_review_comment:
+    types:
+      - 'created'
+  pull_request_review:
+    types:
+      - 'submitted'
+  issue_comment:
+    types:
+      - 'created'
+  issues:
+    types:
+      - 'opened'
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.event.issue.number }}'
+  cancel-in-progress: |-
+    ${{ github.event.sender.type == 'User' && ( github.event.issue.author_association == 'OWNER' || github.event.issue.author_association == 'MEMBER' || github.event.issue.author_association == 'COLLABORATOR') }}
+
+defaults:
+  run:
+    shell: 'bash'
+
+permissions:
+  contents: 'write'
+  id-token: 'write'
+  pull-requests: 'write'
+  issues: 'write'
+
+jobs:
+  # gemini-cli:
+  #   # This condition seeks to ensure the action is only run when it is triggered by a trusted user.
+  #   # For private repos, users who have access to the repo are considered trusted.
+  #   # For public repos, users who members, owners, or collaborators are considered trusted.
+  #   if: |-
+  #     github.event_name == 'workflow_dispatch' ||
+  #     (
+  #       github.event_name == 'issues' && github.event.action == 'opened' &&
+  #       contains(github.event.issue.body, '@gemini-cli') &&
+  #       !contains(github.event.issue.body, '@gemini-cli /review') &&
+  #       !contains(github.event.issue.body, '@gemini-cli /triage') &&
+  #       (
+  #         github.event.repository.private == true ||
+  #         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association)
+  #       )
+  #     ) ||
+  #     (
+  #       (
+  #         github.event_name == 'issue_comment' ||
+  #         github.event_name == 'pull_request_review_comment'
+  #       ) &&
+  #       contains(github.event.comment.body, '@gemini-cli') &&
+  #       !contains(github.event.comment.body, '@gemini-cli /review') &&
+  #       !contains(github.event.comment.body, '@gemini-cli /triage') &&
+  #       (
+  #         github.event.repository.private == true ||
+  #         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+  #       )
+  #     ) ||
+  #     (
+  #       github.event_name == 'pull_request_review' &&
+  #       contains(github.event.review.body, '@gemini-cli') &&
+  #       !contains(github.event.review.body, '@gemini-cli /review') &&
+  #       !contains(github.event.review.body, '@gemini-cli /triage') &&
+  #       (
+  #         github.event.repository.private == true ||
+  #         contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
+  #       )
+  #     )
+
+  gemini-cli:
+    # 一時的にシンプルな条件に変更してテスト
+    if: |-
+      github.event_name == 'issues' && github.event.action == 'opened' &&
+      contains(github.event.issue.body, '@gemini-cli')
+
+    timeout-minutes: 10
+    runs-on: 'ubuntu-latest'
+    steps:
+      - name: 'Debug Event Information'
+        run: |-
+          echo "Event Name: ${{ github.event_name }}"
+          echo "Event Action: ${{ github.event.action }}"
+          echo "Issue Author: ${{ github.event.issue.user.login }}"
+          echo "Author Association: ${{ github.event.issue.author_association }}"
+
+      - name: 'Generate GitHub App Token'
+        id: 'generate_token'
+        if: |-
+          ${{ vars.APP_ID }}
+        uses: 'actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e' # ratchet:actions/create-github-app-token@v2
+        with:
+          app-id: '${{ vars.APP_ID }}'
+          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
+
+      - name: 'Get context from event'
+        id: 'get_context'
+        env:
+          EVENT_NAME: '${{ github.event_name }}'
+          EVENT_PAYLOAD: '${{ toJSON(github.event) }}'
+        run: |-
+          set -euo pipefail
+
+          USER_REQUEST=""
+          ISSUE_NUMBER=""
+          IS_PR="false"
+
+          if [[ "${EVENT_NAME}" == "issues" ]]; then
+            USER_REQUEST=$(echo "${EVENT_PAYLOAD}" | jq -r .issue.body)
+            ISSUE_NUMBER=$(echo "${EVENT_PAYLOAD}" | jq -r .issue.number)
+          elif [[ "${EVENT_NAME}" == "issue_comment" ]]; then
+            USER_REQUEST=$(echo "${EVENT_PAYLOAD}" | jq -r .comment.body)
+            ISSUE_NUMBER=$(echo "${EVENT_PAYLOAD}" | jq -r .issue.number)
+            if [[ $(echo "${EVENT_PAYLOAD}" | jq -r .issue.pull_request) != "null" ]]; then
+              IS_PR="true"
+            fi
+          elif [[ "${EVENT_NAME}" == "pull_request_review" ]]; then
+            USER_REQUEST=$(echo "${EVENT_PAYLOAD}" | jq -r .review.body)
+            ISSUE_NUMBER=$(echo "${EVENT_PAYLOAD}" | jq -r .pull_request.number)
+            IS_PR="true"
+          elif [[ "${EVENT_NAME}" == "pull_request_review_comment" ]]; then
+            USER_REQUEST=$(echo "${EVENT_PAYLOAD}" | jq -r .comment.body)
+            ISSUE_NUMBER=$(echo "${EVENT_PAYLOAD}" | jq -r .pull_request.number)
+            IS_PR="true"
+          fi
+
+          # Clean up user request
+          CLEANED_USER_REQUEST=$(echo "${USER_REQUEST}" | sed 's/.*@gemini-cli//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          
+          # ⬇⬇⬇ ここからが修正箇所 ⬇⬇⬇
+          # GITHUB_OUTPUTへの書き込みをヒアドキュメント形式に変更して、特殊文字によるエラーを回避
+          {
+            echo 'user_request<<EOF'
+            echo "${CLEANED_USER_REQUEST}"
+            echo 'EOF'
+            echo "issue_number=${ISSUE_NUMBER}"
+            echo "is_pr=${IS_PR}"
+          } >> "${GITHUB_OUTPUT}"
+          # ⬆⬆⬆ ここまでが修正箇所 ⬆⬆⬆
+
+      - name: 'Set up git user for commits'
+        run: |-
+          git config --global user.name 'gemini-cli[bot]'
+          git config --global user.email 'gemini-cli[bot]@users.noreply.github.com'
+
+      - name: 'Checkout PR branch'
+        if: |-
+          ${{  steps.get_context.outputs.is_pr == 'true' }}
+        uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # ratchet:actions/checkout@v4
+        with:
+          token: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          repository: '${{ github.repository }}'
+          ref: 'refs/pull/${{ steps.get_context.outputs.issue_number }}/head'
+          fetch-depth: 0
+
+      - name: 'Checkout main branch'
+        if: |-
+          ${{  steps.get_context.outputs.is_pr == 'false' }}
+        uses: 'actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683' # ratchet:actions/checkout@v4
+        with:
+          token: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          repository: '${{ github.repository }}'
+          fetch-depth: 0
+
+      - name: 'Acknowledge request'
+        env:
+          GITHUB_ACTOR: '${{ github.actor }}'
+          GITHUB_TOKEN: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          ISSUE_NUMBER: '${{ steps.get_context.outputs.issue_number }}'
+          REPOSITORY: '${{ github.repository }}'
+          REQUEST_TYPE: '${{ steps.get_context.outputs.request_type }}'
+        run: |-
+          set -euo pipefail
+          MESSAGE="@${GITHUB_ACTOR} I've received your request and I'm working on it now! 🤖"
+          if [[ -n "${MESSAGE}" ]]; then
+            gh issue comment "${ISSUE_NUMBER}" \
+              --body "${MESSAGE}" \
+              --repo "${REPOSITORY}"
+          fi
+
+      - name: 'Get description'
+        id: 'get_description'
+        env:
+          GITHUB_TOKEN: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          IS_PR: '${{ steps.get_context.outputs.is_pr }}'
+          ISSUE_NUMBER: '${{ steps.get_context.outputs.issue_number }}'
+        run: |-
+          set -euo pipefail
+          if [[ "${IS_PR}" == "true" ]]; then
+            DESCRIPTION=$(gh pr view "${ISSUE_NUMBER}" --json body --template '{{.body}}')
+          else
+            DESCRIPTION=$(gh issue view "${ISSUE_NUMBER}" --json body --template '{{.body}}')
+          fi
+          {
+            echo "description<<EOF"
+            echo "${DESCRIPTION}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: 'Get comments'
+        id: 'get_comments'
+        env:
+          GITHUB_TOKEN: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          IS_PR: '${{ steps.get_context.outputs.is_pr }}'
+          ISSUE_NUMBER: '${{ steps.get_context.outputs.issue_number }}'
+        run: |-
+          set -euo pipefail
+          if [[ "${IS_PR}" == "true" ]]; then
+            COMMENTS=$(gh pr view "${ISSUE_NUMBER}" --json comments --template '{{range .comments}}{{.author.login}}: {{.body}}{{"\n"}}{{end}}')
+          else
+            COMMENTS=$(gh issue view "${ISSUE_NUMBER}" --json comments --template '{{range .comments}}{{.author.login}}: {{.body}}{{"\n"}}{{end}}')
+          fi
+          {
+            echo "comments<<EOF"
+            echo "${COMMENTS}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: 'Read prompt from file (JA)'
+        id: 'read_prompt'
+        env:
+          REPOSITORY: '${{ github.repository }}'
+          EVENT_NAME: '${{ github.event_name }}'
+          ISSUE_NUMBER: '${{ steps.get_context.outputs.issue_number }}'
+          IS_PR: '${{ steps.get_context.outputs.is_pr }}'
+          DESCRIPTION: '${{ steps.get_description.outputs.description }}'
+          COMMENTS: '${{ steps.get_comments.outputs.comments }}'
+          USER_REQUEST: '${{ steps.get_context.outputs.user_request }}'
+        run: |-
+          set -euo pipefail
+          TEMPLATE_PATH=".github/prompts/gemini-cli_prompt.ja.md"
+          if [[ ! -f "${TEMPLATE_PATH}" ]]; then
+            echo "Prompt template not found: ${TEMPLATE_PATH}" >&2
+            exit 1
+          fi
+
+          # sedの代わりにperlを使用して、改行を含む変数を安全に置換
+          EXPANDED=$(perl -p -e '
+            s/\$\{REPOSITORY\}/$ENV{REPOSITORY}/g;
+            s/\$\{EVENT_NAME\}/$ENV{EVENT_NAME}/g;
+            s/\$\{ISSUE_NUMBER\}/$ENV{ISSUE_NUMBER}/g;
+            s/\$\{IS_PR\}/$ENV{IS_PR}/g;
+            s/\$\{DESCRIPTION\}/$ENV{DESCRIPTION}/g;
+            s/\$\{COMMENTS\}/$ENV{COMMENTS}/g;
+            s/\$\{USER_REQUEST\}/$ENV{USER_REQUEST}/g;
+          ' "${TEMPLATE_PATH}")
+
+          {
+            echo "prompt<<EOF"
+            echo "${EXPANDED}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: 'Run Gemini'
+        id: 'run_gemini'
+        uses: 'google-github-actions/run-gemini-cli@v0'
+        env:
+          GITHUB_TOKEN: '${{ steps.generate_token.outputs.token || secrets.GH_PAT }}'
+          REPOSITORY: '${{ github.repository }}'
+          USER_REQUEST: '${{ steps.get_context.outputs.user_request }}'
+          ISSUE_NUMBER: '${{ steps.get_context.outputs.issue_number }}'
+          IS_PR: '${{ steps.get_context.outputs.is_pr }}'
+        with:
+          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
+          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
+          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
+          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
+          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
+          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
+          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
+          settings: |-
+            {
+              "debug": ${{ fromJSON(env.DEBUG || env.ACTIONS_STEP_DEBUG || false) }},
+              "maxSessionTurns": 50,
+              "telemetry": {
+                "enabled": false,
+                "target": "gcp"
+              }
+            }
+          prompt: ${{ steps.read_prompt.outputs.prompt }}

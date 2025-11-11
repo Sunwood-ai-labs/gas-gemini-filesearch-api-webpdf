@@ -1,0 +1,237 @@
+name: "📝 Gemini Release Notes (Remote)"
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # 環境変数で制御可能な設定
+  MAX_COMMITS: 300
+  MAX_FILES: 500
+  MAX_CONTRIBUTORS: 200
+  MAX_DIFF_LINES: 2000  # 新規追加: 差分の最大行数
+  MAX_DIFF_CHARS: 200000  # 差分の最大文字数（バイト数相当）
+  REMOTE_REPO: 'Sunwood-ai-labsII/gemini-actions-lab'
+  REMOTE_BRANCH: 'main'
+
+jobs:
+  release-notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # ratchet:actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+
+      # リモートからスクリプトを取得🚀
+      - name: Download remote script
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/remote-scripts
+          SCRIPT_URL="https://raw.githubusercontent.com/${REMOTE_REPO}/${REMOTE_BRANCH}/.github/scripts/clamp_diff.py"
+          curl -fsSL "${SCRIPT_URL}" -o /tmp/remote-scripts/clamp_diff.py
+          chmod +x /tmp/remote-scripts/clamp_diff.py
+          echo "✨ スクリプトをリモートから取得したよ〜！"
+
+      - name: Prepare context
+        id: ctx
+        env:
+          REPOSITORY: "${{ github.repository }}"
+          TAG_NAME: "${{ github.ref_name }}"
+          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          MAX_COMMITS: "${{ env.MAX_COMMITS }}"
+          MAX_FILES: "${{ env.MAX_FILES }}"
+          MAX_CONTRIBUTORS: "${{ env.MAX_CONTRIBUTORS }}"
+          MAX_DIFF_LINES: "${{ env.MAX_DIFF_LINES }}"
+          MAX_DIFF_CHARS: "${{ env.MAX_DIFF_CHARS }}"
+        run: |
+          set -euo pipefail
+          TAG="${TAG_NAME}"
+          git fetch --tags --prune --force >/dev/null 2>&1 || true
+          # Try to get previous released tag (from Releases). Fallback to previous git tag reachable from current.
+          PREV_RELEASE_TAG="$(gh release list --limit 100 --json tagName --jq 'map(.tagName) | map(select(. != env.TAG)) | .[0]' || true)"
+          if [[ -z "${PREV_RELEASE_TAG}" || "${PREV_RELEASE_TAG}" == "null" ]]; then
+            PREV_RELEASE_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          fi
+          BASE_RANGE=""
+          COMPARE_URL=""
+          if [[ -n "${PREV_RELEASE_TAG}" ]]; then
+            BASE_RANGE="${PREV_RELEASE_TAG}..${TAG}"
+            COMPARE_URL="https://github.com/${REPOSITORY}/compare/${PREV_RELEASE_TAG}...${TAG}"
+          else
+            # Initial release: include history up to the tag commit
+            BASE_RANGE="${TAG}"
+          fi
+          # Collect data (trim to keep prompt concise)
+          COMMITS="$(git log --no-merges --pretty=format:'- %s (%h) by %an' ${BASE_RANGE} | head -n ${MAX_COMMITS} || true)"
+          CHANGED_FILES="$( ( [[ -n "${PREV_RELEASE_TAG}" ]] && git diff --name-only ${BASE_RANGE} || git ls-tree -r --name-only HEAD ) | sed 's/^/- /' | head -n ${MAX_FILES} || true)"
+          CONTRIBUTORS="$(git log --format='%an' ${BASE_RANGE} | sort -u | sed 's/^/- /' | head -n ${MAX_CONTRIBUTORS} || true)"
+          
+          # 🔥 新規追加: 実際のコード差分を取得
+          echo "Collecting code diff (max ${MAX_DIFF_LINES} lines)..."
+          DIFF_EXCLUDES=(
+            ':!*.png' ':!*.jpg' ':!*.jpeg' ':!*.gif' ':!*.webp' ':!*.avif'
+            ':!*.svg' ':!*.svgz' ':!*.pdf' ':!*.drawio' ':!*.dio'
+            ':!*.mp4' ':!*.mov' ':!*.zip' ':!*.gz' ':!*.bz2' ':!*.xz'
+          )
+          # リモートスクリプトを使用💪
+          clamp_diff() {
+            local max_lines="$1"
+            local max_chars="$2"
+            python3 /tmp/remote-scripts/clamp_diff.py "$max_lines" "$max_chars"
+          }
+
+          if [[ -n "${PREV_RELEASE_TAG}" ]]; then
+            # 前のリリースとの差分
+            DIFF_CMD=(git diff --no-color "${BASE_RANGE}")
+            DIFF_STATS_CMD=(git diff --stat --no-color "${BASE_RANGE}")
+            if ((${#DIFF_EXCLUDES[@]} > 0)); then
+              DIFF_CMD+=(-- "${DIFF_EXCLUDES[@]}")
+              DIFF_STATS_CMD+=(-- "${DIFF_EXCLUDES[@]}")
+            fi
+            DIFF_CONTENT="$("${DIFF_CMD[@]}" | clamp_diff "${MAX_DIFF_LINES}" "${MAX_DIFF_CHARS}" || true)"
+            DIFF_STATS="$("${DIFF_STATS_CMD[@]}" | head -n 100 || true)"
+          else
+            # 初回リリース: 全ファイル内容（制限付き）
+            DIFF_CONTENT="$(git show --format="" --name-status HEAD | clamp_diff "${MAX_DIFF_LINES}" "${MAX_DIFF_CHARS}" || true)"
+            DIFF_STATS="$(git ls-tree -r --name-only HEAD | wc -l) files in initial release"
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "prev_tag=${PREV_RELEASE_TAG}"
+            echo "compare_url=${COMPARE_URL}"
+            echo 'commits<<EOF'
+            echo "${COMMITS}"
+            echo 'EOF'
+            echo 'files<<EOF'
+            echo "${CHANGED_FILES}"
+            echo 'EOF'
+            echo 'contributors<<EOF'
+            echo "${CONTRIBUTORS}"
+            echo 'EOF'
+            echo 'diff_stats<<EOF'
+            echo "${DIFF_STATS}"
+            echo 'EOF'
+            echo 'diff_content<<EOF'
+            echo "${DIFF_CONTENT}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "✅ Collected context:"
+          echo "  - Commits: $(echo "${COMMITS}" | wc -l) entries"
+          echo "  - Files: $(echo "${CHANGED_FILES}" | wc -l) entries"
+          echo "  - Contributors: $(echo "${CONTRIBUTORS}" | wc -l) entries"
+          diff_line_count=$(echo "${DIFF_CONTENT}" | wc -l | awk '{print $1}')
+          echo "  - Diff lines: ${diff_line_count} lines (max: ${MAX_DIFF_LINES})"
+
+      - name: Generate Gemini release notes
+        id: gemini
+        uses: google-github-actions/run-gemini-cli@v0
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gcp_workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          gcp_project_id: ${{ vars.GOOGLE_CLOUD_PROJECT }}
+          gcp_location: ${{ vars.GOOGLE_CLOUD_LOCATION }}
+          gcp_service_account: ${{ vars.SERVICE_ACCOUNT_EMAIL }}
+          use_vertex_ai: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}
+          use_gemini_code_assist: ${{ vars.GOOGLE_GENAI_USE_GCA }}
+          settings: |-
+            {
+              "debug": ${{ fromJSON(env.DEBUG || env.ACTIONS_STEP_DEBUG || false) }},
+              "maxSessionTurns": 12,
+              "telemetry": {
+                "enabled": false,
+                "target": "gcp"
+              }
+            }
+          prompt: |-
+            あなたは、GitHub Actionsによる自動リリースノート生成を担当するアシスタントです。
+            以下のコンテキストをもとに、魅力的で分かりやすいリリースノートを日本語で作成してください。
+
+            ## リリース情報
+            - **タグ**: ${{ steps.ctx.outputs.tag }}
+            - **前回タグ**: ${{ steps.ctx.outputs.prev_tag }}
+            ${{ steps.ctx.outputs.compare_url && format('- **差分比較**: {0}', steps.ctx.outputs.compare_url) || '' }}
+
+            ## コミット履歴
+            ${{ steps.ctx.outputs.commits }}
+
+            ## 変更ファイル
+            ${{ steps.ctx.outputs.files }}
+
+            ## コントリビューター
+            ${{ steps.ctx.outputs.contributors }}
+
+            ## 差分統計
+            ${{ steps.ctx.outputs.diff_stats }}
+
+            ## コード差分 (抜粋)
+            ```diff
+            ${{ steps.ctx.outputs.diff_content }}
+            ```
+
+            ## 指示
+            上記の情報をもとに、以下の形式でリリースノートを作成してください：
+
+            ### フォーマット
+            ```markdown
+            ## 🎉 [タグ名] - [リリース日]
+
+            ### 📋 概要
+            このリリースの主な変更点を簡潔に説明してください。
+
+            ### ✨ 新機能
+            - 追加された機能を箇条書きで列挙
+
+            ### 🐛 バグ修正
+            - 修正されたバグを箇条書きで列挙
+
+            ### 🔧 改善
+            - パフォーマンス改善や内部的な変更を箇条書きで列挙
+
+            ### 📝 ドキュメント
+            - ドキュメントの更新を箇条書きで列挙
+
+            ### 🙏 コントリビューター
+            このリリースに貢献してくださった方々（コミット作成者リストから）
+
+            ### 📦 インストール
+            ```bash
+            # インストール方法やアップグレード方法を記載
+            ```
+
+            ### 🔗 リンク
+            - [完全な変更履歴](${{ steps.ctx.outputs.compare_url }})
+            ```
+
+            ## 注意事項
+            - 技術的な詳細は適度に抽象化し、ユーザーにとって分かりやすい表現を心がけてください
+            - 変更の重要度に応じてセクションを調整してください（該当項目がない場合は省略可）
+            - コード差分から実質的な変更内容を読み取り、適切なカテゴリに分類してください
+            - コミットメッセージから意図を推測し、ユーザー視点でのメリットを記述してください
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ctx.outputs.tag }}
+          RELEASE_NOTES: ${{ steps.gemini.outputs.summary != '' && steps.gemini.outputs.summary || steps.gemini.outputs.text }}
+        run: |
+          set -euo pipefail
+          echo "${RELEASE_NOTES}" > release-notes.md
+          gh release create "${TAG}" \
+            --title "Release ${TAG}" \
+            --notes-file release-notes.md \
+            --verify-tag || {
+              echo "Failed to create release. It may already exist."
+              gh release edit "${TAG}" --notes-file release-notes.md || true
+            }
+          echo "✅ Release published: ${TAG}"

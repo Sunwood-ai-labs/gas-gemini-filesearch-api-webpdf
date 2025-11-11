@@ -1,0 +1,475 @@
+name: "📰 Gemini Release Article"
+
+on:
+  workflow_run:
+    workflows:
+      - "📝 Gemini Release Notes"
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  MAX_COMMITS: 300
+  MAX_FILES: 500
+  MAX_CONTRIBUTORS: 200
+  MAX_DIFF_LINES: 2000
+  OASIS_ARTICLE_REPOSITORY: ${{ vars.OASIS_ARTICLE_REPOSITORY || 'Sunwood-ai-labs/oasis-sync' }}
+  OASIS_ARTICLE_REPOSITORY_REF: ${{ vars.OASIS_ARTICLE_REPOSITORY_REF || github.event.repository.default_branch }}
+
+jobs:
+  oasis-article:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # ratchet:actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Determine release tag
+        id: tag
+        env:
+          TRIGGER_SHA: "${{ github.event.workflow_run.head_sha }}"
+          HEAD_BRANCH: "${{ github.event.workflow_run.head_branch }}"
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --prune >/dev/null 2>&1 || true
+          TAGS_FOR_SHA="$(git tag --points-at "${TRIGGER_SHA}" || true)"
+          TAG="$(echo "${TAGS_FOR_SHA}" | head -n 1 || true)"
+          if [[ -z "${TAG}" && -n "${HEAD_BRANCH}" ]]; then
+            TAG="${HEAD_BRANCH}"
+          fi
+          if [[ -z "${TAG}" ]]; then
+            echo "Could not determine tag for trigger SHA ${TRIGGER_SHA}" >&2
+            exit 1
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "sha=${TRIGGER_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare context
+        id: ctx
+        env:
+          REPOSITORY: "${{ github.repository }}"
+          TAG_NAME: "${{ steps.tag.outputs.tag }}"
+          GITHUB_TOKEN: "${{ secrets.GH_PAT }}"
+          MAX_COMMITS: "${{ env.MAX_COMMITS }}"
+          MAX_FILES: "${{ env.MAX_FILES }}"
+          MAX_CONTRIBUTORS: "${{ env.MAX_CONTRIBUTORS }}"
+          MAX_DIFF_LINES: "${{ env.MAX_DIFF_LINES }}"
+        run: |
+          set -euo pipefail
+          TAG="${TAG_NAME}"
+          git fetch --tags --prune --force >/dev/null 2>&1 || true
+          PREV_RELEASE_TAG="$(gh release list --limit 100 --json tagName --jq 'map(.tagName) | map(select(. != env.TAG)) | .[0]' || true)"
+          if [[ -z "${PREV_RELEASE_TAG}" || "${PREV_RELEASE_TAG}" == "null" ]]; then
+            PREV_RELEASE_TAG="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+          fi
+          BASE_RANGE=""
+          COMPARE_URL=""
+          if [[ -n "${PREV_RELEASE_TAG}" ]]; then
+            BASE_RANGE="${PREV_RELEASE_TAG}..${TAG}"
+            COMPARE_URL="https://github.com/${REPOSITORY}/compare/${PREV_RELEASE_TAG}...${TAG}"
+          else
+            BASE_RANGE="${TAG}"
+          fi
+          COMMITS="$(git log --no-merges --pretty=format:'- %s (%h) by %an' ${BASE_RANGE} | head -n ${MAX_COMMITS} || true)"
+          CHANGED_FILES="$( ( [[ -n "${PREV_RELEASE_TAG}" ]] && git diff --name-only ${BASE_RANGE} || git ls-tree -r --name-only HEAD ) | sed 's/^/- /' | head -n ${MAX_FILES} || true)"
+          CONTRIBUTORS="$(git log --format='%an' ${BASE_RANGE} | sort -u | sed 's/^/- /' | head -n ${MAX_CONTRIBUTORS} || true)"
+          echo "Collecting code diff (max ${MAX_DIFF_LINES} lines)..."
+          if [[ -n "${PREV_RELEASE_TAG}" ]]; then
+            DIFF_CONTENT="$(git diff ${BASE_RANGE} | head -n ${MAX_DIFF_LINES} || true)"
+            DIFF_STATS="$(git diff --stat ${BASE_RANGE} | head -n 100 || true)"
+          else
+            DIFF_CONTENT="$(git show --format="" --name-status HEAD | head -n ${MAX_DIFF_LINES} || true)"
+            DIFF_STATS="$(git ls-tree -r --name-only HEAD | wc -l) files in initial release"
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "prev_tag=${PREV_RELEASE_TAG}"
+            echo "compare_url=${COMPARE_URL}"
+            echo 'commits<<EOF'
+            echo "${COMMITS}"
+            echo 'EOF'
+            echo 'files<<EOF'
+            echo "${CHANGED_FILES}"
+            echo 'EOF'
+            echo 'contributors<<EOF'
+            echo "${CONTRIBUTORS}"
+            echo 'EOF'
+            echo 'diff_stats<<EOF'
+            echo "${DIFF_STATS}"
+            echo 'EOF'
+            echo 'diff_content<<EOF'
+            echo "${DIFF_CONTENT}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch release notes body
+        id: notes
+        env:
+          TAG: "${{ steps.ctx.outputs.tag }}"
+          GITHUB_TOKEN: "${{ secrets.GH_PAT }}"
+        run: |
+          set -euo pipefail
+          NOTES="$(gh release view "${TAG}" --json body --jq '.body' || true)"
+          if [[ -z "${NOTES}" ]]; then
+            echo "Release notes for ${TAG} were not found" >&2
+            exit 1
+          fi
+          {
+            echo 'summary<<EOF'
+            echo "${NOTES}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Locate header image
+        id: header
+        env:
+          TAG: "${{ steps.ctx.outputs.tag }}"
+          REPOSITORY: "${{ github.repository }}"
+          DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}"
+        run: |
+          set -euo pipefail
+          base_dir="generated-images"
+          if [[ ! -d "${base_dir}" ]]; then
+            echo "No generated-images directory detected; skipping header image lookup."
+            exit 0
+          fi
+          dir=$(find "${base_dir}" -maxdepth 1 -type d -name "release-${TAG}-*" | sort | tail -n 1 || true)
+          if [[ -z "${dir}" ]]; then
+            echo "No header directory found for tag ${TAG}"
+            exit 0
+          fi
+          image=$(find "${dir}" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | sort | head -n 1 || true)
+          if [[ -z "${image}" ]]; then
+            echo "No header image file found in ${dir}"
+            exit 0
+          fi
+          image_name="$(basename "${image}")"
+          raw_url="https://raw.githubusercontent.com/${REPOSITORY}/${DEFAULT_BRANCH}/${image}"
+          {
+            echo "image_path=${image}"
+            echo "image_name=${image_name}"
+            echo "raw_url=${raw_url}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Found header image: ${image}"
+          echo "RAW URL: ${raw_url}"
+
+      - name: Load sample article
+        id: sample_article
+        run: |
+          set -euo pipefail
+          SAMPLE_PATH=".github/prompts/git-it-write-guide-20251012.md"
+          if [[ ! -f "${SAMPLE_PATH}" ]]; then
+            echo "sample_path=${SAMPLE_PATH}" >> "$GITHUB_OUTPUT"
+            echo "content=" >> "$GITHUB_OUTPUT"
+            echo "Sample article file ${SAMPLE_PATH} was not found." >&2
+            exit 0
+          fi
+          {
+            echo "sample_path=${SAMPLE_PATH}"
+            echo 'content<<EOF'
+            cat "${SAMPLE_PATH}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate Oasis article with Gemini
+        id: oasis_article
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          REPOSITORY: "${{ github.repository }}"
+          TAG_NAME: "${{ steps.ctx.outputs.tag }}"
+          PREV_TAG: "${{ steps.ctx.outputs.prev_tag }}"
+          COMPARE_URL: "${{ steps.ctx.outputs.compare_url }}"
+          COMMITS: "${{ steps.ctx.outputs.commits }}"
+          CHANGED_FILES: "${{ steps.ctx.outputs.files }}"
+          CONTRIBUTORS: "${{ steps.ctx.outputs.contributors }}"
+          DIFF_STATS: "${{ steps.ctx.outputs.diff_stats }}"
+          DIFF_CONTENT: "${{ steps.ctx.outputs.diff_content }}"
+          RELEASE_NOTES: "${{ steps.notes.outputs.summary }}"
+          HEADER_IMAGE_URL: "${{ steps.header.outputs.raw_url }}"
+          HEADER_IMAGE_NAME: "${{ steps.header.outputs.image_name }}"
+        with:
+          gemini_api_key: "${{ secrets.GEMINI_API_KEY }}"
+          gcp_workload_identity_provider: "${{ vars.GCP_WIF_PROVIDER }}"
+          gcp_project_id: "${{ vars.GOOGLE_CLOUD_PROJECT }}"
+          gcp_location: "${{ vars.GOOGLE_CLOUD_LOCATION }}"
+          gcp_service_account: "${{ vars.SERVICE_ACCOUNT_EMAIL }}"
+          use_vertex_ai: "${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}"
+          use_gemini_code_assist: "${{ vars.GOOGLE_GENAI_USE_GCA }}"
+          settings: |
+            { "debug": false, "maxSessionTurns": 10, "telemetry": { "enabled": false, "target": "gcp" } }
+          prompt: |
+            あなたはOasisフォーマットの技術記事作成のエキスパートです。以下の情報を基に、GitHubリリースノートを題材とした技術記事を生成してください。
+            
+            # 目的
+            - GitHubリリースの技術的な背景をわかりやすくまとめたリリースノート記事を作成する
+            - Oasisフォーマット（zenn/qiita/wordpress front matter + 本文）で出力する
+            - 参考フォーマット: articles/oasis/git-it-write-guide-20251012-V5.md
+            - 以下のサンプル記事構成を参考にする
+            
+            # フロントマター要件
+            - 先頭を `---` で開始し、最後も `---` で閉じる
+            - `zenn`, `qiita`, `wordpress` の順でネストしたセクションを作る
+            - `zenn`:
+              - `title`: "【リリースノート】{推測したプロジェクト名} ${{ steps.ctx.outputs.tag }} - {主要な変更点を短く要約}"
+              - `emoji`: 記事内容に合う1文字
+              - `type`: `tech`
+              - `topics`: 4〜5件の関連技術キーワード（英小文字、ハイフン区切り可）
+              - `published`: true
+            - `qiita`:
+              - `title`: Zennタイトルと同じ
+              - `tags`: 5件（先頭大文字推奨、技術的に関連する単語）
+              - `private`: false
+              - `updated_at`: null
+              - `id`: null
+              - `organization_url_name`: null
+              - `slide`: false
+              - `ignorePublish`: false
+            - `wordpress`:
+              - `title`: 同じタイトル
+              - `post_status`: `publish`
+              - `post_excerpt`: 2〜3文で要約
+              - `featured_image`: ヘッダー画像が存在すれば `${{ steps.header.outputs.raw_url }}`、無ければ空文字 `""`
+              - `taxonomy.category`: 2〜3件のカテゴリキー
+              - `taxonomy.post_tag`: 5件のタグ
+              - `custom_fields.lead`: 記事冒頭で使うリード文（2〜3文）
+            - 配列は YAML のリスト構文（`- value`）を使い、インデントは2スペースで統一する
+            - 未設定の文字列は空文字 `""` を使用し、null 項目は `null` を明記する
+            - front matter と本文の間には空行を1行入れる
+            
+            # 本文要件
+            - セクション構成は以下を基本とし、必要に応じて補足見出しを追加する
+              - `## はじめに`
+              - `## 主な変更点`
+              - `## 技術的な詳細`
+              - `### 新機能`
+              - `### 改善点`
+              - `### バグ修正`
+              - `## まとめ`
+              - `---`
+              - `📚 参考リンク`
+            - `HEADER_IMAGE_URL` があれば front matter の直後に `![<image_name>](<image_url>)` 形式で画像を挿入する
+            - 変更点はリリースノート・コミット・差分を引用しながら、開発者が理解しやすい言葉で解説する
+            - 必要に応じてコードブロックや表、箇条書きを使って整理する
+            - 文章は日本語で作成し、具体的なメリット、移行手順、注意点を含める
+            - 本文冒頭でタイトルを再掲せず、front matter のタイトルと重複させない
+            - 本文全体は通常のMarkdownとして出力し、三連バッククォートなどのコードブロックで全体を囲まない
+            - 各見出しは一度だけマークダウン記法を付け、`##` や `###` が重複しないようにする
+            - 見出しや節タイトルに番号を付けず、シンプルなテキストのみで表現する
+            - `📚 参考リンク` には GitHub リポジトリ、比較URL、リリースページを含める
+            - 箇条書きや表のスタイル、リード文のトーンは下記サンプルと整合させる
+            
+            # サンプル記事 (参考用、出力には含めない)
+            ```markdown
+            ${{ steps.sample_article.outputs.content }}
+            ```
+
+            # 提供データ
+            - リポジトリ: ${{ github.repository }}
+            - リリースタグ: ${{ steps.ctx.outputs.tag }}
+            - 前リリースタグ: ${{ steps.ctx.outputs.prev_tag }}
+            - 比較URL: ${{ steps.ctx.outputs.compare_url }}
+            - ヘッダー画像URL: ${{ steps.header.outputs.raw_url }}
+            - ヘッダー画像ファイル名: ${{ steps.header.outputs.image_name }}
+            - リリースノート本文:
+              ${{ steps.notes.outputs.summary }}
+            - 差分統計:
+              ${{ steps.ctx.outputs.diff_stats }}
+            - 差分内容:
+              ```diff
+              ${{ steps.ctx.outputs.diff_content }}
+              ```
+            - コミット一覧:
+              ${{ steps.ctx.outputs.commits }}
+            - 変更ファイル一覧:
+              ${{ steps.ctx.outputs.files }}
+            - 主要貢献者:
+              ${{ steps.ctx.outputs.contributors }}
+            
+            # 出力形式
+            - Oasisフォーマットに準拠した1つのMarkdownドキュメントのみを出力する
+            - 生成結果はコードブロックで囲まず、front matter と本文だけを含める
+            - 説明文や余計なコメントは含めない
+
+      - name: Clone target article repository
+        id: clone_target
+        env:
+          TARGET_REPOSITORY: "${{ env.OASIS_ARTICLE_REPOSITORY }}"
+          TARGET_REF: "${{ env.OASIS_ARTICLE_REPOSITORY_REF }}"
+          GITHUB_TOKEN: "${{ secrets.GH_PAT }}"
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_REPOSITORY}" ]]; then
+            echo "OASIS_ARTICLE_REPOSITORY must not be empty." >&2
+            exit 1
+          fi
+          if [[ -z "${GITHUB_TOKEN}" ]]; then
+            echo "GITHUB_TOKEN is required to clone the target repository." >&2
+            exit 1
+          fi
+          CLONE_ROOT="$(mktemp -d "${RUNNER_TEMP}/oasis-articles-XXXXXX")"
+          CLONE_DIR="${CLONE_ROOT}/repo"
+          GIT_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${TARGET_REPOSITORY}.git"
+          git clone --depth 1 "${GIT_URL}" "${CLONE_DIR}"
+          pushd "${CLONE_DIR}" >/dev/null
+          DEFAULT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          if [[ -n "${TARGET_REF}" && "${TARGET_REF}" != "${DEFAULT_BRANCH}" ]]; then
+            if git ls-remote --exit-code --heads origin "${TARGET_REF}" >/dev/null 2>&1; then
+              git fetch origin "${TARGET_REF}:${TARGET_REF}" --depth 1 >/dev/null 2>&1 || true
+              git checkout "${TARGET_REF}" >/dev/null 2>&1
+            else
+              git checkout -b "${TARGET_REF}" >/dev/null 2>&1
+            fi
+          fi
+          popd >/dev/null
+          {
+            echo "dir=${CLONE_DIR}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Oasis article file
+        id: oasis_file
+        env:
+          TAG: "${{ steps.ctx.outputs.tag }}"
+          REPOSITORY: "${{ github.repository }}"
+          OASIS_CONTENT: "${{ steps.oasis_article.outputs.summary }}"
+          HEADER_IMAGE_URL: "${{ steps.header.outputs.raw_url }}"
+          HEADER_IMAGE_NAME: "${{ steps.header.outputs.image_name }}"
+          TARGET_DIR: "${{ steps.clone_target.outputs.dir }}"
+        run: |
+          set -euo pipefail
+          if [[ -z "${TARGET_DIR}" ]]; then
+            echo "Target repository directory not provided." >&2
+            exit 1
+          fi
+          REPO_NAME="${REPOSITORY##*/}"
+          TAG_CLEAN="${TAG#v}"
+          TIMESTAMP=$(date +%Y%m%d)
+          RAW_SLUG="${TIMESTAMP}-${REPO_NAME}-${TAG_CLEAN}-release"
+          RAW_SLUG="${RAW_SLUG,,}"
+          SLUG=$(echo "${RAW_SLUG}" \
+            | sed 's/[^a-z0-9_-]/-/g' \
+            | sed -E 's/-{2,}/-/g' \
+            | sed -E 's/_{2,}/_/g' \
+            | sed -E 's/^[-_]+//; s/[-_]+$//')
+          if [[ -z "${SLUG}" ]]; then
+            SLUG="${TIMESTAMP}-release"
+          fi
+          if [[ ${#SLUG} -gt 50 ]]; then
+            SLUG="${SLUG:0:50}"
+            SLUG=$(echo "${SLUG}" | sed -E 's/[-_]+$//')
+          fi
+          while [[ ${#SLUG} -lt 12 ]]; do
+            SLUG="${SLUG}x"
+          done
+          if [[ ! "${SLUG}" =~ ^[a-z0-9_-]{12,50}$ ]]; then
+            echo "生成されたslug '${SLUG}' が制約を満たしません" >&2
+            exit 1
+          fi
+          FILENAME="${SLUG}.md"
+          FILEPATH="articles/oasis/${FILENAME}"
+          mkdir -p "articles/oasis"
+          RAW_FILE="$(mktemp)"
+          CLEAN_FILE="$(mktemp)"
+          trap 'rm -f "${RAW_FILE}" "${CLEAN_FILE}"' EXIT
+          printf "%s\n" "${OASIS_CONTENT}" > "${RAW_FILE}"
+          FIRST_LINE="$(head -n 1 "${RAW_FILE}")"
+          LAST_LINE="$(tail -n 1 "${RAW_FILE}")"
+          CONTENT_FILE="${RAW_FILE}"
+          if [[ "${FIRST_LINE}" =~ ^\`\`\`(markdown)?$ ]] && [[ "${LAST_LINE}" == '```' ]]; then
+            if [[ $(wc -l < "${RAW_FILE}") -ge 2 ]]; then
+              sed '1d;$d' "${RAW_FILE}" > "${CLEAN_FILE}"
+              CONTENT_FILE="${CLEAN_FILE}"
+            fi
+          fi
+          if [[ -z "$(tr -d '[:space:]' < "${CONTENT_FILE}")" ]]; then
+            echo "生成された記事コンテンツが空です" >&2
+            exit 1
+          fi
+          FILEPATH_REL="articles/oasis/${FILENAME}"
+          FILEPATH="${TARGET_DIR}/${FILEPATH_REL}"
+          mkdir -p "$(dirname "${FILEPATH}")"
+          HAS_CHANGES="true"
+          if [[ -f "${FILEPATH}" ]] && diff -q "${CONTENT_FILE}" "${FILEPATH}" >/dev/null; then
+            HAS_CHANGES="false"
+            echo "No content changes detected for ${FILEPATH_REL}"
+          else
+            cp "${CONTENT_FILE}" "${FILEPATH}"
+            echo "✅ Oasis article prepared at ${FILEPATH_REL}"
+          fi
+          rm -f "${RAW_FILE}" "${CLEAN_FILE}"
+          trap - EXIT
+          echo "oasis_filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "oasis_filepath=${FILEPATH_REL}" >> "$GITHUB_OUTPUT"
+          echo "oasis_fullpath=${FILEPATH}" >> "$GITHUB_OUTPUT"
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "has_changes=${HAS_CHANGES}" >> "$GITHUB_OUTPUT"
+
+      - name: Push Oasis article to target repository
+        env:
+          TARGET_REPOSITORY: "${{ env.OASIS_ARTICLE_REPOSITORY }}"
+          TARGET_REF: "${{ env.OASIS_ARTICLE_REPOSITORY_REF }}"
+          TARGET_DIR: "${{ steps.clone_target.outputs.dir }}"
+          OASIS_FILEPATH: "${{ steps.oasis_file.outputs.oasis_filepath }}"
+          OASIS_FULLPATH: "${{ steps.oasis_file.outputs.oasis_fullpath }}"
+          HAS_CHANGES: "${{ steps.oasis_file.outputs.has_changes }}"
+          COMMIT_MESSAGE: "📰 Add Oasis release article for ${{ github.repository }} ${{ steps.ctx.outputs.tag }}"
+          GITHUB_TOKEN: "${{ secrets.GH_PAT }}"
+        run: |
+          set -euo pipefail
+          if [[ "${HAS_CHANGES}" != "true" ]]; then
+            echo "No content changes to publish."
+            exit 0
+          fi
+          if [[ -z "${TARGET_DIR}" ]]; then
+            echo "Target repository directory not provided." >&2
+            exit 1
+          fi
+          if [[ -z "${OASIS_FILEPATH}" || -z "${OASIS_FULLPATH}" ]]; then
+            echo "Article file paths not provided." >&2
+            exit 1
+          fi
+          if [[ ! -f "${OASIS_FULLPATH}" ]]; then
+            echo "Article file ${OASIS_FULLPATH} was not found." >&2
+            exit 1
+          fi
+          if [[ -z "${TARGET_REPOSITORY}" ]]; then
+            echo "OASIS_ARTICLE_REPOSITORY must not be empty." >&2
+            exit 1
+          fi
+          if [[ -z "${GITHUB_TOKEN}" ]]; then
+            echo "GITHUB_TOKEN is required to push changes." >&2
+            exit 1
+          fi
+          export GH_TOKEN="${GITHUB_TOKEN}"
+          gh auth setup-git >/dev/null
+          pushd "${TARGET_DIR}" >/dev/null
+          if [[ -n "${TARGET_REF}" ]]; then
+            git checkout "${TARGET_REF}" >/dev/null 2>&1 || git checkout -b "${TARGET_REF}"
+          fi
+          git add "${OASIS_FILEPATH}"
+          if git diff --cached --quiet; then
+            echo "No staged changes to commit."
+            popd >/dev/null
+            exit 0
+          fi
+          AUTHOR_LOGIN="$(gh api user --jq .login 2>/dev/null || echo "")"
+          if [[ -z "${AUTHOR_LOGIN}" || "${AUTHOR_LOGIN}" == "null" ]]; then
+            AUTHOR_LOGIN="oasis-automation"
+          fi
+          git config user.name "${AUTHOR_LOGIN}"
+          git config user.email "${AUTHOR_LOGIN}@users.noreply.github.com"
+          git commit -m "${COMMIT_MESSAGE}"
+          git push origin "${TARGET_REF}"
+          popd >/dev/null

@@ -1,0 +1,124 @@
+name: "🚀 Deploy to Hugging Face Space"
+
+on:
+  workflow_dispatch:
+    inputs:
+      space_slug:
+        description: "Space repository slug (e.g. my-awesome-space)"
+        required: true
+      space_org:
+        description: "Organization (leave blank to use the authenticated user)"
+        required: false
+        default: ""
+      space_sdk:
+        description: "Hugging Face Space SDK (gradio, streamlit, static, docker, etc.)"
+        required: true
+        default: "gradio"
+      space_private:
+        description: "Create the Space as private (true/false)"
+        required: true
+        default: "false"
+      space_hardware:
+        description: "Hardware tier (optional, e.g. cpu-basic, t4-small, a10g-large)"
+        required: false
+        default: ""
+      source_dir:
+        description: "Relative path containing the Space assets"
+        required: true
+        default: "."
+      space_branch:
+        description: "Branch to push to on the Space repository"
+        required: true
+        default: "main"
+
+jobs:
+  deploy:
+    name: "Deploy"
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      HF_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure Hugging Face Space exists
+        id: ensure_space
+        env:
+          SPACE_SLUG: ${{ inputs.space_slug }}
+          SPACE_ORG: ${{ inputs.space_org }}
+          SPACE_SDK: ${{ inputs.space_sdk }}
+          SPACE_PRIVATE: ${{ inputs.space_private }}
+          SPACE_HARDWARE: ${{ inputs.space_hardware }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "::error::The HUGGINGFACE_TOKEN secret is required to deploy." >&2
+            exit 1
+          fi
+
+          python .github/scripts/ensure_hf_space.py
+
+      - name: Prepare Space content
+        env:
+          SOURCE_DIR: ${{ inputs.source_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p space-dist
+          rsync -av --delete --exclude='.git/' --exclude='.github/' "${SOURCE_DIR}/" space-dist/
+
+      - name: Push to Hugging Face Space
+        env:
+          SPACE_BRANCH: ${{ inputs.space_branch }}
+          SPACE_SLUG: ${{ inputs.space_slug }}
+          SPACE_OWNER: ${{ steps.ensure_space.outputs.space_owner }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "::error::The HUGGINGFACE_TOKEN secret is required to deploy." >&2
+            exit 1
+          fi
+
+          cd space-dist
+          git init
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add .
+          if git diff --cached --quiet; then
+            git commit --allow-empty -m "Deploy from GitHub Actions run ${GITHUB_RUN_NUMBER}"
+          else
+            git commit -m "Deploy from GitHub Actions run ${GITHUB_RUN_NUMBER}"
+          fi
+          git branch -M "${SPACE_BRANCH}"
+
+          remote_url="https://huggingface.co/spaces/${SPACE_OWNER}/${SPACE_SLUG}.git"
+          remote_url_auth="https://hf-user:${HF_TOKEN}@huggingface.co/spaces/${SPACE_OWNER}/${SPACE_SLUG}.git"
+          git remote add origin "${remote_url_auth}"
+          git push --force origin "${SPACE_BRANCH}"
+
+          echo "Deployed to ${remote_url}"
+
+      - name: Post summary
+        env:
+          SPACE_URL: ${{ steps.ensure_space.outputs.space_url }}
+          SPACE_CREATED: ${{ steps.ensure_space.outputs.space_created }}
+        run: |
+          {
+            echo "## 🚀 Hugging Face Space Deployment"
+            echo ""
+            echo "- Space: [${SPACE_URL}](${SPACE_URL})"
+            echo "- Newly created this run: ${SPACE_CREATED}"
+            echo "- SDK: \`${{ inputs.space_sdk }}\`"
+            echo "- Source directory: \`${{ inputs.source_dir }}\`"
+            echo "- Branch: \`${{ inputs.space_branch }}\`"
+            echo "- Visibility: \`${{ inputs.space_private }}\`"
+            if [ -n "${{ inputs.space_hardware }}" ]; then
+              echo "- Hardware: \`${{ inputs.space_hardware }}\`"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"

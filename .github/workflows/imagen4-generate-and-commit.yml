@@ -1,0 +1,153 @@
+name: "🎨 imagen4-commit-via-gemini-cli"
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_prompt:
+        description: '作りたい画像のプロンプト'
+        required: true
+        default: 'A beautiful Japanese landscape with cherry blossoms and mountains'
+      model:
+        description: '画像生成モデル (imagen-4 / imagen-4-ultra / imagen-3)'
+        required: false
+        default: 'imagen-4'
+      num:
+        description: '生成枚数'
+        required: false
+        default: '2'
+      aspect_ratio:
+        description: 'アスペクト比 (例: 1:1, 16:9, 9:16)'
+        required: false
+        default: '1:1'
+      seed:
+        description: 'シード値 (オプション)'
+        required: false
+        default: ''
+
+jobs:
+  generate_and_commit:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+      
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create output directory
+        run: |
+          mkdir -p generated-images
+          echo "Created generated-images directory"
+          ls -la
+
+      - name: Generate images via Gemini CLI (+ Imagen MCP)
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          NUM: ${{ github.event.inputs.num }}
+          PROMPT: ${{ github.event.inputs.image_prompt }}
+          AR: ${{ github.event.inputs.aspect_ratio }}
+          SEED: ${{ github.event.inputs.seed }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: gemini-2.5-flash
+          gemini_debug: true
+          settings: |
+            {
+              "mcpServers": {
+                "gemini-imagen": {
+                  "command": "npx",
+                  "args": ["-y", "gemini-imagen-mcp-server",
+                           "--output-dir", "generated-images",
+                           "--model", "${{ github.event.inputs.model }}"],
+                  "env": { "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}" },
+                  "trust": true,
+                  "includeTools": ["generate_image"]
+                }
+              }
+            }
+          prompt: |
+            Use the @gemini-imagen.generate_image tool to generate ${{ github.event.inputs.num }} image(s)
+            from this prompt: "${{ github.event.inputs.image_prompt }}".
+            Use aspect ratio "${{ github.event.inputs.aspect_ratio }}".
+            ${{ github.event.inputs.seed != '' && format('If a seed is provided, use it: "{0}".', github.event.inputs.seed) || '' }}
+            Save files under ./generated-images and list only the filenames.
+
+      - name: Verify generated files
+        run: |
+          set -euo pipefail
+          if [ ! -d generated-images ]; then
+            echo "generated-images not found"; exit 1
+          fi
+          echo "== Generated files =="
+          ls -lh generated-images
+          cnt=$(ls -1 generated-images | wc -l)
+          if [ "$cnt" -lt 1 ]; then
+            echo "No images were generated"; exit 1
+          fi
+          echo "✅ Successfully generated $cnt file(s)"
+
+      - name: Add metadata file
+        run: |
+          cat > generated-images/metadata.json << EOF
+          {
+            "generation_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "prompt": "${{ github.event.inputs.image_prompt }}",
+            "model": "${{ github.event.inputs.model }}",
+            "num_images": ${{ github.event.inputs.num }},
+            "aspect_ratio": "${{ github.event.inputs.aspect_ratio }}",
+            "seed": "${{ github.event.inputs.seed }}",
+            "workflow_run": "${{ github.run_number }}",
+            "commit_sha": "${{ github.sha }}"
+          }
+          EOF
+          echo "Created metadata file:"
+          cat generated-images/metadata.json
+
+      - name: Commit and push generated images
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add generated-images/
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🎨 Generate images via Gemini Imagen API
+            
+            Prompt: ${{ github.event.inputs.image_prompt }}
+            Model: ${{ github.event.inputs.model }}
+            Images: ${{ github.event.inputs.num }}
+            Aspect ratio: ${{ github.event.inputs.aspect_ratio }}
+            Seed: ${{ github.event.inputs.seed }}
+            Generated at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            
+            git push
+            echo "✅ Successfully committed and pushed generated images"
+          fi
+
+      - name: Upload generated images as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generated-images-${{ github.run_number }}
+          path: generated-images/
+          retention-days: 30
+
+      - name: Create workflow summary
+        run: |
+          echo "## 🎨 Image Generation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Prompt:** ${{ github.event.inputs.image_prompt }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Model:** ${{ github.event.inputs.model }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Number of Images:** ${{ github.event.inputs.num }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Aspect Ratio:** ${{ github.event.inputs.aspect_ratio }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Seed:** ${{ github.event.inputs.seed || 'Random' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Generated Files" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          ls -la generated-images/ >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

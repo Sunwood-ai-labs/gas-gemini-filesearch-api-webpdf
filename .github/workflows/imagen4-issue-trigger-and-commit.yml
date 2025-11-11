@@ -1,0 +1,318 @@
+name: "🎨 imagen4-via-issue-comment"
+
+on:
+  issue_comment:
+    types: [created]
+  issues:
+    types: [opened, edited]
+
+jobs:
+  check_trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      should_generate: ${{ steps.parse.outputs.should_generate }}
+      image_prompt: ${{ steps.parse.outputs.image_prompt }}
+      model: ${{ steps.parse.outputs.model }}
+      num: ${{ steps.parse.outputs.num }}
+      aspect_ratio: ${{ steps.parse.outputs.aspect_ratio }}
+      seed: ${{ steps.parse.outputs.seed }}
+    steps:
+      - name: Parse comment for image generation command
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment?.body || context.payload.issue?.body || '';
+            console.log('Comment body:', comment);
+            
+            // コマンドパターンをチェック
+            const patterns = [
+              /\/imagen4\s+(.+)/i,
+              /@imagen4\s+(.+)/i
+            ];
+            
+            let match = null;
+            for (const pattern of patterns) {
+              match = comment.match(pattern);
+              if (match) break;
+            }
+            
+            if (!match) {
+              console.log('No image generation command found');
+              core.setOutput('should_generate', 'false');
+              return;
+            }
+            
+            console.log('Found command:', match[0]);
+            core.setOutput('should_generate', 'true');
+            
+            // プロンプトを抽出
+            let prompt = match[1].trim();
+            
+            // オプションパラメータを解析
+            let model = 'imagen-4';
+            let num = '2';
+            let aspectRatio = '1:1';
+            let seed = '';
+            
+            const modelMatch = comment.match(/model:\s*([^\s,]+)/i);
+            if (modelMatch) model = modelMatch[1];
+            
+            const numMatch = comment.match(/num:\s*(\d+)/i);
+            if (numMatch) num = numMatch[1];
+            
+            const ratioMatch = comment.match(/ratio:\s*([^\s,]+)/i);
+            if (ratioMatch) aspectRatio = ratioMatch[1];
+            
+            const seedMatch = comment.match(/seed:\s*([^\s,]+)/i);
+            if (seedMatch) seed = seedMatch[1];
+            
+            // プロンプトからパラメータ部分を除去
+            prompt = prompt.replace(/\s*(model|num|ratio|seed):\s*[^\s,]+/gi, '').trim();
+            
+            console.log('Parsed parameters:', { prompt, model, num, aspectRatio, seed });
+            
+            core.setOutput('image_prompt', prompt);
+            core.setOutput('model', model);
+            core.setOutput('num', num);
+            core.setOutput('aspect_ratio', aspectRatio);
+            core.setOutput('seed', seed);
+
+  generate_and_commit:
+    needs: check_trigger
+    runs-on: ubuntu-latest
+    if: needs.check_trigger.outputs.should_generate == 'true'
+    
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      
+    steps:
+      # ここで「トリガー（コメント or issue本文）」と「issue本体」の両方に 👀 を付与
+      - name: Add reaction to trigger (comment or issue body)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            // issue本体へ 👀
+            await github.rest.reactions.createForIssue({
+              owner, repo,
+              issue_number,
+              content: 'eyes'
+            });
+
+            // コメントイベントならコメントにも 👀
+            if (context.payload.comment) {
+              await github.rest.reactions.createForIssueComment({
+                owner, repo,
+                comment_id: context.payload.comment.id,
+                content: 'eyes'
+              });
+            }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create output directory
+        run: |
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          issue_number="${{ github.event.issue.number }}"
+          dir_name="generated-images/issue-${issue_number}-${timestamp}"
+          mkdir -p "$dir_name"
+          echo "OUTPUT_DIR=$dir_name" >> $GITHUB_ENV
+          echo "Created directory: $dir_name"
+
+      - name: Generate images via Gemini CLI (+ Imagen MCP)
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          NUM: ${{ needs.check_trigger.outputs.num }}
+          PROMPT: ${{ needs.check_trigger.outputs.image_prompt }}
+          AR: ${{ needs.check_trigger.outputs.aspect_ratio }}
+          SEED: ${{ needs.check_trigger.outputs.seed }}
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_model: gemini-2.5-flash
+          gemini_debug: true
+          settings: |
+            {
+              "mcpServers": {
+                "gemini-imagen": {
+                  "command": "npx",
+                  "args": ["-y", "gemini-imagen-mcp-server",
+                           "--output-dir", "${{ env.OUTPUT_DIR }}",
+                           "--model", "${{ needs.check_trigger.outputs.model }}"],
+                  "env": { "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}" },
+                  "trust": true,
+                  "includeTools": ["generate_image"]
+                }
+              }
+            }
+          prompt: |
+            Use the @gemini-imagen.generate_image tool to generate ${{ needs.check_trigger.outputs.num }} image(s)
+            from this prompt: "${{ needs.check_trigger.outputs.image_prompt }}".
+            Use aspect ratio "${{ needs.check_trigger.outputs.aspect_ratio }}".
+            ${{ needs.check_trigger.outputs.seed != '' && format('If a seed is provided, use it: "{0}".', needs.check_trigger.outputs.seed) || '' }}
+            Save files under ./${{ env.OUTPUT_DIR }} and list only the filenames.
+
+      - name: Verify generated files
+        run: |
+          set -euo pipefail
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "$OUTPUT_DIR not found"; exit 1
+          fi
+          echo "== Generated files =="
+          ls -lh "$OUTPUT_DIR"
+          cnt=$(ls -1 "$OUTPUT_DIR" | wc -l)
+          if [ "$cnt" -lt 1 ]; then
+            echo "No images were generated"; exit 1
+          fi
+          echo "✅ Successfully generated $cnt file(s)"
+          echo "FILE_COUNT=$cnt" >> $GITHUB_ENV
+
+      - name: Add metadata file
+        run: |
+          cat > "$OUTPUT_DIR/metadata.json" << 'EOF'
+          {
+            "generation_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "prompt": "${{ needs.check_trigger.outputs.image_prompt }}",
+            "model": "${{ needs.check_trigger.outputs.model }}",
+            "num_images": ${{ needs.check_trigger.outputs.num }},
+            "aspect_ratio": "${{ needs.check_trigger.outputs.aspect_ratio }}",
+            "seed": "${{ needs.check_trigger.outputs.seed }}",
+            "workflow_run": "${{ github.run_number }}",
+            "commit_sha": "${{ github.sha }}",
+            "issue_number": ${{ github.event.issue.number }},
+            "triggered_by": "${{ github.event.comment && github.event.comment.user.login || github.event.issue.user.login }}"
+          }
+          EOF
+          echo "Created metadata file:"
+          cat "$OUTPUT_DIR/metadata.json"
+
+      - name: Commit and push generated images
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          git add "$OUTPUT_DIR/"
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "🎨 Generate images for issue #${{ github.event.issue.number }}
+
+            Prompt: ${{ needs.check_trigger.outputs.image_prompt }}
+            Model: ${{ needs.check_trigger.outputs.model }}
+            Images: ${{ needs.check_trigger.outputs.num }}
+            Aspect ratio: ${{ needs.check_trigger.outputs.aspect_ratio }}
+            Seed: ${{ needs.check_trigger.outputs.seed }}
+            Triggered by: @${{ github.event.comment && github.event.comment.user.login || github.event.issue.user.login }}
+            Generated at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            
+            git push
+            echo "✅ Successfully committed and pushed generated images"
+          fi
+
+      - name: Upload generated images as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: generated-images-issue-${{ github.event.issue.number }}-${{ github.run_number }}
+          path: ${{ env.OUTPUT_DIR }}/
+          retention-days: 30
+
+      - name: Comment on issue with results
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            const outputDir = process.env.OUTPUT_DIR;
+            const fileCount = process.env.FILE_COUNT || '0';
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const branch = 'main'; // 必要に応じて変更
+            
+            let commentBody = `## 🎨 画像生成完了\n\n`;
+            commentBody += `**プロンプト:** ${{ needs.check_trigger.outputs.image_prompt }}\n`;
+            commentBody += `**モデル:** ${{ needs.check_trigger.outputs.model }}\n`;
+            commentBody += `**生成枚数:** ${fileCount}\n`;
+            commentBody += `**アスペクト比:** ${{ needs.check_trigger.outputs.aspect_ratio }}\n`;
+            commentBody += `**シード:** ${{ needs.check_trigger.outputs.seed || 'ランダム' }}\n\n`;
+            
+            if (fs.existsSync(outputDir)) {
+              const files = fs.readdirSync(outputDir).filter(f => /\.(png|jpg|jpeg)$/i.test(f));
+              if (files.length > 0) {
+                commentBody += `### 🖼️ 生成された画像\n\n`;
+                for (const [idx, file] of files.entries()) {
+                  const relativePath = path.join(outputDir, file).replace(/\\/g, '/');
+                  const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/refs/heads/${branch}/${relativePath}`;
+                  commentBody += `#### 画像 ${idx + 1}: ${file}\n`;
+                  commentBody += `![${file}](${rawUrl})\n`;
+                  commentBody += `[🔗 直接リンク](${rawUrl})\n\n`;
+                }
+                commentBody += `📁 [アーティファクトをダウンロード](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+              } else {
+                commentBody += `❌ 画像の生成に失敗しました。\n`;
+              }
+            } else {
+              commentBody += `❌ 出力ディレクトリが見つかりません。\n`;
+            }
+            
+            commentBody += `\n---\n*Workflow run: [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})*`;
+            
+            await github.rest.issues.createComment({
+              owner, repo,
+              issue_number,
+              body: commentBody
+            });
+
+      # 成功時：コメント＆issue本体にリアクション
+      - name: Add success reactions (comment & issue)
+        uses: actions/github-script@v7
+        if: success()
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            // issue本体へ 👍 と 🚀
+            await github.rest.reactions.createForIssue({ owner, repo, issue_number, content: '+1' });
+            await github.rest.reactions.createForIssue({ owner, repo, issue_number, content: 'rocket' });
+
+            // コメントがトリガーなら、コメントにも 👍
+            if (context.payload.comment) {
+              await github.rest.reactions.createForIssueComment({
+                owner, repo,
+                comment_id: context.payload.comment.id,
+                content: '+1'
+              });
+            }
+
+      # 失敗時：コメント＆issue本体にリアクション
+      - name: Add failure reactions (comment & issue)
+        uses: actions/github-script@v7
+        if: failure()
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            // issue本体へ 👎 と 😕
+            await github.rest.reactions.createForIssue({ owner, repo, issue_number, content: '-1' });
+            await github.rest.reactions.createForIssue({ owner, repo, issue_number, content: 'confused' });
+
+            // コメントがトリガーなら、コメントにも 👎
+            if (context.payload.comment) {
+              await github.rest.reactions.createForIssueComment({
+                owner, repo,
+                comment_id: context.payload.comment.id,
+                content: '-1'
+              });
+            }
