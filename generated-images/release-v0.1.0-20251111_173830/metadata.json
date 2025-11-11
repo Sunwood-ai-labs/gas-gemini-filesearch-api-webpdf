@@ -1,0 +1,12 @@
+{
+  "generation_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "prompt": "A soft polymer clay cloud dragon figurine with rounded, childlike proportions — large head, small body, friendly handmade texture. Its wings and scales blend shades of sky blue and milky white, symbolizing fluid data movement. Gentle, even lighting in an off-white space reveals subtle matte texture.
+Add elegant serif text “gas gemini filesearch api webpdf - v0.1.0 -” beneath the figure, balanced like a design catalog layout.",
+  "model": "imagen-4-ultra",
+  "num_images": 1,
+  "aspect_ratio": "16:9",
+  "seed": "",
+  "workflow_run": "1",
+  "commit_sha": "2e4fe4d848b74f13a9df68afb3be4d1cb114f151",
+  "tag": "v0.1.0"
+}
