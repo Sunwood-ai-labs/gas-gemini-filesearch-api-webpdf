@@ -1,7 +1,5 @@
 <div align="center">
-
-# 🌐 gas-gemini-filesearch-api-webpdf
-
+    
 ![](Whisk_6d5c0a5b0dcbd96a9a94e8bd845add56dr.jpeg)
 
 <img src="https://raw.githubusercontent.com/github/explore/main/topics/google-apps-script/google-apps-script.png" alt="Google Apps Script" width="160" />
@@ -10,6 +8,9 @@
 ![Gemini API](https://img.shields.io/badge/Gemini%20API-3D5AFE?style=for-the-badge&logo=google&logoColor=white)
 ![PDF Processing](https://img.shields.io/badge/PDF-FF5252?style=for-the-badge&logo=adobeacrobatreader&logoColor=white)
 ![License MIT](https://img.shields.io/badge/License-MIT-4CAF50?style=for-the-badge)
+
+
+# 🌐 gas-gemini-filesearch-api-webpdf
 
 </div>
 
