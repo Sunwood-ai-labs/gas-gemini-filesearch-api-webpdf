@@ -2,6 +2,8 @@
 
 # 🌐 gas-gemini-filesearch-api-webpdf
 
+![](Whisk_6d5c0a5b0dcbd96a9a94e8bd845add56dr.jpeg)
+
 <img src="https://raw.githubusercontent.com/github/explore/main/topics/google-apps-script/google-apps-script.png" alt="Google Apps Script" width="160" />
 
 ![Google Apps Script](https://img.shields.io/badge/Google%20Apps%20Script-4285F4?style=for-the-badge&logo=google-apps-script&logoColor=white)
